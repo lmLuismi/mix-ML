@@ -419,32 +419,31 @@ def vista_cliente():
 
 
     with st.form("pedido"):
-            nombre = st.text_input("Tu nombre")
-            tel = st.text_input("Tu celular (WhatsApp)")
-            enviar = st.form_submit_button("Confirmar pedido", type="primary", use_container_width=True)
+        nombre = st.text_input("Tu nombre")
+        tel = st.text_input("Tu celular (WhatsApp)")
+        enviar = st.form_submit_button("Confirmar pedido", type="primary", use_container_width=True)
+
     if enviar:
+        resultado = None
         if not st.session_state.mix:
             st.error("Agrega al menos un producto a tu mix.")
         elif len(nombre.strip()) < 2:
-            resultado = None
-
-            if len(nombre.strip()) < 2:
-                st.error("Escribe tu nombre.")
-            elif len("".join(c for c in tel if c.isdigit())) < 7:
-                st.error("Escribe un celular válido, solo números.")
-            else:
-                try:
-                    resultado = crear_pedido(nombre, tel, tope, tipo, dict(st.session_state.mix))
-                except ValueError as e:
-                    st.error(str(e))
-                except Exception as e:
-                    st.error("No pudimos guardar tu pedido.")
-                    st.code(str(e))
-            if resultado:
-                st.session_state.ultimo = resultado
-                st.session_state.mix = {}
-                st.session_state.receta_items = None
-                st.rerun()
+            st.error("Escribe tu nombre.")
+        elif len("".join(c for c in tel if c.isdigit())) < 7:
+            st.error("Escribe un celular válido, solo números.")
+        else:
+            try:
+                resultado = crear_pedido(nombre, tel, tope, tipo, dict(st.session_state.mix))
+            except ValueError as e:
+                st.error(str(e))
+            except Exception as e:
+                mostrar_error(e)
+                st.error("No pudimos guardar tu pedido. Inténtalo de nuevo.")
+        if resultado:
+            st.session_state.ultimo = resultado
+            st.session_state.mix = {}
+            st.session_state.receta_items = None
+            st.rerun()
     
 
 # ================= Administrador =================
