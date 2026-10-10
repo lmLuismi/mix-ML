@@ -9,6 +9,7 @@ import streamlit as st
 import os
 from zoneinfo import ZoneInfo
 import hmac
+import hashlib
 import time
 from psycopg2 import pool as pg_pool
 
@@ -26,13 +27,14 @@ log = logging.getLogger("mix")
 
 
 def mostrar_error(e):
-    log.exception("Error en la app")                     # queda en la terminal
-    if secreto("DEBUG", "false").lower() == "true":      # en pantalla solo si tú lo activas
+    log.exception("Error en la app")
+    if secreto("DEBUG", "false").lower() == "true":
         st.code(str(e))
 
 PASO = 10                                  # gramos por toque en + / −
 MONEDA = secreto("MONEDA", "S/")
 ADMIN_CLAVE = secreto("ADMIN_CLAVE")
+ADMIN_HASH = secreto("ADMIN_HASH")         # Hash SHA-256 opcional para mayor seguridad
 WHATSAPP = secreto("WHATSAPP_NUMERO")
 ZONA = secreto("ZONA_HORARIA", "UTC")
 
@@ -113,9 +115,7 @@ def hora(d):  # fecha del servidor -> tu zona horaria
 
 # ================= KARDEX (el corazón del sistema) =================
 def mover(cur, item, iid, cant, motivo, costo=None, pedido_id=None, nota=None, nombre="el producto"):
-    """Único lugar donde cambia el stock. Actualiza saldo, costo promedio y escribe el kardex.
-    item: 'producto' (cantidad en gramos) o 'empaque' (unidades). cant con signo.
-    costo: por gramo o por unidad (solo en entradas). Devuelve el costo unitario usado."""
+    """Único lugar donde cambia el stock. Actualiza saldo, costo promedio y escribe el kardex."""
     if item == "producto":
         cur.execute("SELECT stock_g, costo_kg/1000 FROM productos WHERE id=%s FOR UPDATE", (iid,))
     else:
@@ -198,8 +198,8 @@ def cancelar_pedido(pid):
 
 # ================= Estado del mix =================
 st.session_state.setdefault("mix", {})
-st.session_state.setdefault("receta_items", None)   # receta aplicada: [(producto_id, gramos por 1000 g)]
-st.session_state.setdefault("stock_de", {})         # {producto_id: stock en gramos}
+st.session_state.setdefault("receta_items", None)
+st.session_state.setdefault("stock_de", {})
 
 
 def total_usado():
@@ -207,14 +207,13 @@ def total_usado():
 
 
 def escalar_receta(items, tope, stock_de):
-    """Reparte el tope entre los productos de la receta, en pasos de PASO g y llenando el tope."""
     total = sum(g for _, g in items)
     exactos = {pid: tope * g / total for pid, g in items}
     mix = {pid: int(x // PASO) * PASO for pid, x in exactos.items()}
     resto = tope - sum(mix.values())
     orden = sorted(exactos, key=lambda p: exactos[p] - mix[p], reverse=True)
     i = 0
-    while resto >= PASO and orden:                      # reparte lo que sobró
+    while resto >= PASO and orden:
         mix[orden[i % len(orden)]] += PASO
         resto -= PASO
         i += 1
@@ -228,7 +227,7 @@ def aplicar_receta(items):
 
 
 def cambiar_tamano():
-    if st.session_state.receta_items:                   # si eligió un mix listo, se reescala
+    if st.session_state.receta_items:
         aplicar_receta(st.session_state.receta_items)
     elif total_usado() > st.session_state.tope:
         st.session_state.mix = {}
@@ -256,7 +255,7 @@ def restar(pid):
         st.session_state.mix[pid] = nuevo
 
 # ================= Información nutricional =================
-PORCION_G = 30     # tamaño de porción de la etiqueta (g)
+PORCION_G = 30
 
 NUTRI_COLS = ["kcal_100g", "proteinas_100g", "grasas_100g", "grasas_sat_100g", "grasas_trans_100g",
               "colesterol_100g", "carbohidratos_100g", "azucares_100g", "fibra_100g", "sodio_100g"]
@@ -266,7 +265,7 @@ NUTRI_ETQ = {
     "colesterol_100g": "Colesterol (mg)", "carbohidratos_100g": "Hidratos de carbono disponibles (g)",
     "azucares_100g": "Azúcares totales (g)", "fibra_100g": "Fibra (g)", "sodio_100g": "Sodio (mg)",
 }
-NUTRI_SUB = {"grasas_sat_100g", "grasas_trans_100g", "azucares_100g"}   # filas con sangría
+NUTRI_SUB = {"grasas_sat_100g", "grasas_trans_100g", "azucares_100g"}
 
 
 def num(x):
@@ -369,7 +368,7 @@ def armador(productos, tope, tipo, precio_empaque, nutri):
 
 def vista_cliente():
     if st.session_state.get("ultimo"):
-        return  confirmacion(st.session_state.ultimo)   
+        return confirmacion(st.session_state.ultimo)   
     try:
         t0 = time.perf_counter()
         productos, tamanos, empaques, filas_rec, nutri = catalogo()
@@ -410,7 +409,6 @@ def vista_cliente():
     for rid, emo, nom, desc, pid, g in filas_rec:
         r = recetas.setdefault(rid, {"emoji": emo, "nombre": nom, "desc": desc, "items": []})
         r["items"].append((pid, g))
-    # solo se muestran los mixes cuyos productos están todos disponibles
     recetas = {k: r for k, r in recetas.items() if all(p in nombre_de for p, _ in r["items"])}
 
     if recetas:
@@ -425,17 +423,15 @@ def vista_cliente():
 
     armador(productos, tope, tipo, precio_empaque, nutri)
 
-
     with st.form("pedido"):
-            nombre = st.text_input("Tu nombre")
-            tel = st.text_input("Tu celular (WhatsApp)")
-            enviar = st.form_submit_button("Confirmar pedido", type="primary", use_container_width=True)
+        nombre = st.text_input("Tu nombre")
+        tel = st.text_input("Tu celular (WhatsApp)")
+        enviar = st.form_submit_button("Confirmar pedido", type="primary", use_container_width=True)
     if enviar:
         if not st.session_state.mix:
             st.error("Agrega al menos un producto a tu mix.")
-        elif len(nombre.strip()) < 2:
+        else:
             resultado = None
-
             if len(nombre.strip()) < 2:
                 st.error("Escribe tu nombre.")
             elif len("".join(c for c in tel if c.isdigit())) < 7:
@@ -453,9 +449,10 @@ def vista_cliente():
                 st.session_state.mix = {}
                 st.session_state.receta_items = None
                 st.rerun()
-    
 
-# ================= Administrador =================
+
+# ================= Administrador Optimizado con Fragmentos =================
+@st.cache_data(ttl=30)
 def items_inventario():
     prods = consultar("SELECT id, emoji, nombre, stock_g, costo_kg FROM productos ORDER BY nombre")
     emps = consultar("SELECT id, tipo, gramos, stock, costo FROM empaques ORDER BY tipo, gramos")
@@ -464,6 +461,7 @@ def items_inventario():
     return items
 
 
+@st.fragment
 def tab_pedidos():
     filas = consultar("SELECT id, creado_en, cliente_nombre, cliente_telefono, presentacion_g, empaque_tipo, "
                       "total, costo_total, estado FROM pedidos ORDER BY id DESC LIMIT 100")
@@ -484,13 +482,14 @@ def tab_pedidos():
         if actual == "cancelado":
             st.error("Un pedido cancelado no se puede reactivar. Crea uno nuevo.")
         elif nuevo == "cancelado":
-            cancelar_pedido(int(pid))      # devuelve el stock y deja el rastro en el kardex
+            cancelar_pedido(int(pid))
             st.rerun()
         else:
             ejecutar("UPDATE pedidos SET estado=%s WHERE id=%s", (nuevo, int(pid)))
             st.rerun()
 
 
+@st.fragment
 def tab_kardex():
     items = items_inventario()
     i = st.selectbox("Ver kardex de", range(len(items)), format_func=lambda k: items[k][2], key="kx")
@@ -524,6 +523,7 @@ def tab_kardex():
                        file_name=f"kardex_{etq}.csv", mime="text/csv")
 
 
+@st.fragment
 def tab_inventario():
     items = items_inventario()
     filas, valor_total, sin_costo = [], D(0), False
@@ -538,16 +538,15 @@ def tab_inventario():
                       "Costo promedio": f"{MONEDA}{float(costo):.2f}/{u}", "Valor": f"{MONEDA}{float(valor):.2f}"})
     st.metric("Valor del inventario", f"{MONEDA}{float(valor_total):,.2f}")
     if sin_costo:
-        st.warning("Hay ítems con costo 0: tu ganancia saldrá inflada. Corrige el costo en la pestaña Precios "
-                   "o registra una compra con su costo.")
+        st.warning("Hay ítems con costo 0: tu ganancia saldrá inflada. Corrige el costo en Precios o registra una compra.")
     st.dataframe(pd.DataFrame(filas), hide_index=True, use_container_width=True)
 
     st.subheader("Registrar movimiento")
-    i = st.selectbox("Ítem", range(len(items)), format_func=lambda k: items[k][2])
+    i = st.selectbox("Ítem", range(len(items)), format_func=lambda k: items[k][2], key="mov_item")
     tipo, iid, etq, _, _ = items[i]
     es_prod = tipo == "producto"
     modo = st.radio("Movimiento", ["Compra (entra)", "Merma (sale)", "Conteo: sumar", "Conteo: restar"],
-                    horizontal=True)
+                    horizontal=True, key="mov_modo")
     with st.form("mov", clear_on_submit=True):
         cant = st.number_input("Cantidad en kg" if es_prod else "Cantidad en unidades",
                                min_value=0.0, step=0.5 if es_prod else 1.0)
@@ -572,6 +571,7 @@ def tab_inventario():
                     st.error(str(e))
 
 
+@st.fragment
 def tab_precios():
     st.caption("El stock no se edita aquí: se mueve desde Inventario para que el kardex siempre cuadre.")
     st.subheader("Productos")
@@ -582,7 +582,6 @@ def tab_precios():
                         column_config={"precio_kg": st.column_config.NumberColumn("Precio venta/kg", min_value=0.0, format="%.2f"),
                                        "costo_kg": st.column_config.NumberColumn("Costo/kg", min_value=0.0, format="%.2f"),
                                        "activo": st.column_config.CheckboxColumn("Activo")})
-    st.caption("El costo se actualiza solo con cada compra. Edítalo únicamente para corregir el costo inicial.")
     if st.button("Guardar productos", type="primary"):
         for r in ed.to_dict("records"):
             ejecutar("UPDATE productos SET emoji=%s, nombre=%s, precio_kg=%s, costo_kg=%s, activo=%s WHERE id=%s",
@@ -607,13 +606,13 @@ def tab_precios():
     df = pd.DataFrame(consultar("SELECT id, tipo, gramos, precio, costo, activo FROM empaques ORDER BY tipo, gramos"),
                       columns=["id", "tipo", "gramos", "precio", "costo", "activo"])
     df[["precio", "costo"]] = df[["precio", "costo"]].astype(float)
-    ed = st.data_editor(df, hide_index=True, use_container_width=True, disabled=["id", "tipo", "gramos"],
+    ed_emp = st.data_editor(df, hide_index=True, use_container_width=True, disabled=["id", "tipo", "gramos"],
                         key="ed_emp",
                         column_config={"precio": st.column_config.NumberColumn("Precio venta", min_value=0.0, format="%.2f"),
                                        "costo": st.column_config.NumberColumn("Costo unidad", min_value=0.0, format="%.2f"),
                                        "activo": st.column_config.CheckboxColumn("Activo")})
     if st.button("Guardar empaques", type="primary"):
-        for r in ed.to_dict("records"):
+        for r in ed_emp.to_dict("records"):
             ejecutar("UPDATE empaques SET precio=%s, costo=%s, activo=%s WHERE id=%s",
                      (float(r["precio"]), float(r["costo"]), bool(r["activo"]), int(r["id"])))
         st.success("Empaques guardados.")
@@ -630,7 +629,11 @@ def tab_precios():
                 except Exception:
                     st.error("Ese tipo ya existe para ese tamaño.")
 
+    st.divider()
+    tab_nutricion()
 
+
+@st.fragment
 def tab_ventas():
     filas = []
     for etiqueta, unidad in [("Hoy", "day"), ("Este mes", "month"), ("Total", None)]:
@@ -656,9 +659,9 @@ def tab_ventas():
     else:
         st.info("Aún no hay ventas.")
 
+
 def tab_nutricion():
     st.subheader("Información nutricional (por 100 g)")
-    st.caption("Escribe los valores de la etiqueta de cada producto. Con eso la app calcula la tabla del mix.")
     cols = ["id", "nombre"] + NUTRI_COLS
     df = pd.DataFrame(consultar("SELECT " + ", ".join(cols) + " FROM productos ORDER BY nombre"), columns=cols)
     df[NUTRI_COLS] = df[NUTRI_COLS].astype(float)
@@ -692,7 +695,7 @@ def recetas_guardadas(base):
     st.subheader("Recetas guardadas")
     recetas = consultar("SELECT id, emoji, nombre, descripcion, activo FROM recetas ORDER BY nombre")
     if not recetas:
-        st.info("Aún no guardaste recetas. Arma una arriba y toca «Guardar receta».")
+        st.info("Aún no guardaste recetas.")
         return
     info = base.set_index("id")
     for rid, emoji, nombre, desc, activo in recetas:
@@ -728,9 +731,9 @@ def recetas_guardadas(base):
                 st.rerun()
 
 
+@st.fragment
 def tab_receta():
     st.subheader("Calculadora de receta (por 1000 g)")
-    st.caption("Escribe los gramos de cada producto. Si no suman 1000 g, se ajusta proporcionalmente.")
     cols = ["id", "emoji", "nombre", "precio_kg", "costo_kg"] + NUTRI_COLS
     base = pd.DataFrame(consultar("SELECT " + ", ".join(cols) + " FROM productos WHERE activo ORDER BY nombre"),
                         columns=cols)
@@ -796,9 +799,20 @@ def tab_receta():
 
     recetas_guardadas(base)
 
+
+def verificar_clave(intento):
+    """Valida la contraseña de forma segura usando hash SHA-256 o texto plano si ADMIN_HASH no está definido."""
+    intento_hash = hashlib.sha256(intento.encode("utf-8")).hexdigest()
+    if ADMIN_HASH:
+        return hmac.compare_digest(intento_hash.encode("utf-8"), ADMIN_HASH.encode("utf-8"))
+    elif ADMIN_CLAVE:
+        return hmac.compare_digest(intento.encode("utf-8"), ADMIN_CLAVE.encode("utf-8"))
+    return False
+
+
 def vista_admin():
-    if not ADMIN_CLAVE:
-        st.warning("Falta configurar ADMIN_CLAVE en los secretos.")
+    if not ADMIN_CLAVE and not ADMIN_HASH:
+        st.warning("Falta configurar ADMIN_CLAVE o ADMIN_HASH en los secretos.")
         return
         
     if not st.session_state.get("admin_ok"):
@@ -809,7 +823,7 @@ def vista_admin():
         with st.form("login"):
             intento = st.text_input("Contraseña de administrador", type="password")
             if st.form_submit_button("Entrar"):
-                if hmac.compare_digest(intento.encode(), ADMIN_CLAVE.encode()):
+                if verificar_clave(intento):
                     st.session_state.admin_ok = True
                     st.session_state.intentos = 0
                     st.rerun()
@@ -817,9 +831,11 @@ def vista_admin():
                     st.session_state.intentos = intentos + 1
                     st.error("Contraseña incorrecta.")
         return
+    
     if st.button("Cerrar sesión"):
         st.session_state.admin_ok = False
         st.rerun()
+
     t1, t2, t3, t4, t5, t6 = st.tabs(["📋 Pedidos", "📚 Kardex", "📦 Inventario", "💲 Precios", "📈 Ventas", "🧮 Receta 1 kg"])    
     with t1:
         tab_pedidos()
@@ -829,12 +845,11 @@ def vista_admin():
         tab_inventario()
     with t4:
         tab_precios()
-        st.divider()
-        tab_nutricion()
     with t5:
         tab_ventas()
     with t6:
         tab_receta()
+
 
 tab_cliente, tab_admin = st.tabs(["🥜 Mi mix", "🔐 Admin"])
 with tab_cliente:
