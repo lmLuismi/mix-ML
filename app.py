@@ -31,9 +31,10 @@ def mostrar_error(e):
         st.code(str(e))
 
 PASO = 10                                  # gramos por toque en + / −
+MIN_G = 10                                 # mínimo por producto (si lo incluye); 0 = no incluirlo
 MONEDA = secreto("MONEDA", "S/")
 ADMIN_CLAVE = secreto("ADMIN_CLAVE")
-WHATSAPP = secreto("WHATSAPP_NUMERO")
+WHATSAPP = "".join(c for c in (secreto("WHATSAPP_NUMERO") or "") if c.isdigit())
 ZONA = secreto("ZONA_HORARIA", "UTC")
 
 
@@ -45,6 +46,8 @@ st.markdown("""
 div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; align-items: center; }
 div[data-testid="stColumn"], div[data-testid="column"] { min-width: 0 !important; }
 .stButton > button { min-height: 46px; font-size: 1.2rem; }
+div[data-testid="stNumberInput"] input { text-align: center; font-weight: 700; font-size: 1.2rem; min-height: 46px; }
+[data-testid="stNumberInputStepUp"], [data-testid="stNumberInputStepDown"], div[data-testid="stNumberInput"] button { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -147,6 +150,8 @@ def crear_pedido(nombre, tel, tope, tipo, mix):
         raise ValueError("Agrega al menos un producto.")
     if sum(mix.values()) > tope:
         raise ValueError(f"Tu mix supera el máximo de {tope} g.")
+    if any(g < MIN_G for g in mix.values()):
+        raise ValueError(f"Cada producto debe llevar al menos {MIN_G} g.")
     with transaccion(escribe=True) as cur:
         cur.execute("SELECT id, precio FROM empaques WHERE tipo=%s AND gramos=%s AND activo", (tipo, tope))
         emp = cur.fetchone()
@@ -240,20 +245,55 @@ def vaciar():
     st.session_state.receta_items = None
 
 
-def sumar(pid, stock):
-    st.session_state.receta_items = None
+def margen(pid, stock):
+    """Gramos que todavía se pueden agregar a este producto (tope y stock)."""
     actual = st.session_state.mix.get(pid, 0)
-    if total_usado() + PASO <= st.session_state.tope and actual + PASO <= stock:
-        st.session_state.mix[pid] = actual + PASO
+    return max(0, min(st.session_state.tope - total_usado(), stock - actual))
+
+
+def fijar_producto(pid, valor):
+    st.session_state.receta_items = None
+    if valor <= 0:
+        st.session_state.mix.pop(pid, None)
+    else:
+        st.session_state.mix[pid] = valor
+
+
+def sumar(pid, stock):
+    actual = st.session_state.mix.get(pid, 0)
+    extra = min(PASO, margen(pid, stock))
+    if extra > 0 and actual + extra >= MIN_G:
+        fijar_producto(pid, actual + extra)
 
 
 def restar(pid):
-    st.session_state.receta_items = None
-    nuevo = st.session_state.mix.get(pid, 0) - PASO
-    if nuevo <= 0:
-        st.session_state.mix.pop(pid, None)
+    actual = st.session_state.mix.get(pid, 0)
+    nuevo = actual - PASO
+    if nuevo < MIN_G:
+        nuevo = MIN_G if actual > MIN_G else 0
+    fijar_producto(pid, nuevo)
+
+
+def escribir(pid, stock):
+    """El cliente escribió los gramos: se aceptan los que quiera, entre MIN_G y lo que quepa."""
+    pedido = int(st.session_state.get(f"g{pid}") or 0)
+    actual = st.session_state.mix.get(pid, 0)
+    libre = min(st.session_state.tope - (total_usado() - actual), stock)   # máximo para este producto
+    if pedido <= 0:
+        valor = 0
+    elif libre < MIN_G:
+        valor = 0
+        st.session_state.aviso = "Ya no queda espacio en tu mix para este producto."
+    elif pedido < MIN_G:
+        valor = MIN_G
+        st.session_state.aviso = f"El mínimo por producto es {MIN_G} g."
+    elif pedido > libre:
+        valor = libre
+        st.session_state.aviso = f"Máximo para este producto: {libre} g."
     else:
-        st.session_state.mix[pid] = nuevo
+        valor = pedido
+    fijar_producto(pid, valor)
+
 
 # ================= Información nutricional =================
 PORCION_G = 30     # tamaño de porción de la etiqueta (g)
@@ -319,14 +359,14 @@ def catalogo():
 
 # ================= Vista del cliente =================
 def confirmacion(u):
-    st.title("¡Pedido recibido! Gracias por tu compra! 🎉")
-    st.success(f"{u['gramos']} g · Total {MONEDA}{u['total']:.2f}")
+    st.title("¡Pedido recibido! 🎉")
+    st.success(f"Pedido #{u['id']} · {u['gramos']} g · Total {MONEDA}{u['total']:.2f}")
     for nom, g, sub in u["lineas"]:
         st.write(f"**{nom}** — {g} g · {MONEDA}{sub:.2f}")
     st.write(f"Empaque {u['empaque']} — {MONEDA}{u['precio_emp']:.2f}")
     if WHATSAPP:
         detalle = "\n".join(f"- {n}: {g} g" for n, g, _ in u["lineas"])
-        msg = (f"Hola, soy {u['nombre']}. (mix de {u['gramos']} g, "
+        msg = (f"Hola, soy {u['nombre']}. Pedido #{u['id']} (mix de {u['gramos']} g, "
                f"empaque {u['empaque']}):\n{detalle}\nTotal: {MONEDA}{u['total']:.2f}")
         st.link_button("Enviar por WhatsApp", f"https://wa.me/{WHATSAPP}?text={urllib.parse.quote(msg)}",
                        use_container_width=True, type="primary")
@@ -340,15 +380,23 @@ def armador(productos, tope, tipo, precio_empaque, nutri):
     if st.session_state.mix:
         st.button("🗑️ Vaciar mi mix", on_click=vaciar)
 
+    aviso = st.session_state.pop("aviso", None)
+    if aviso:
+        st.toast(aviso)
+    st.caption(f"Toca + o − , o escribe los gramos que quieras (mínimo {MIN_G} g por producto). "
+               "Después de escribir, toca fuera del cuadro o pulsa Enter.")
     for pid, emoji, nombre, precio_kg, stock in productos:
         gramos = st.session_state.mix.get(pid, 0)
-        c1, c2, c3, c4 = st.columns([4, 1.3, 1.8, 1.3])
+        st.session_state[f"g{pid}"] = gramos          # el cuadro siempre refleja el mix real
+        libre = margen(pid, stock)
+        c1, c2, c3, c4 = st.columns([3.2, 1.2, 2.2, 1.2])
         c1.markdown(f"{emoji} **{nombre}**  \n{MONEDA}{float(precio_kg):.2f} /kg")
         c2.button("−", key=f"m{pid}", on_click=restar, args=(pid,), disabled=gramos == 0,
                   use_container_width=True)
-        c3.markdown(f"**{gramos} g**")
+        c3.number_input(f"Gramos de {nombre}", min_value=0, step=PASO, format="%d", key=f"g{pid}",
+                        label_visibility="collapsed", on_change=escribir, args=(pid, stock))
         c4.button("+", key=f"p{pid}", on_click=sumar, args=(pid, stock),
-                  disabled=total_usado() + PASO > tope or gramos + PASO > stock,
+                  disabled=libre == 0 or gramos + min(PASO, libre) < MIN_G,
                   use_container_width=True)
 
     usado = total_usado()
