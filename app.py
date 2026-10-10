@@ -8,6 +8,7 @@ import streamlit as st
 
 import os
 from zoneinfo import ZoneInfo
+import hmac
 
 
 def secreto(nombre, defecto=""):
@@ -19,6 +20,14 @@ def secreto(nombre, defecto=""):
         pass
     return os.getenv(nombre, defecto)
 
+import logging
+log = logging.getLogger("mix")
+
+
+def mostrar_error(e):
+    log.exception("Error en la app")                     # queda en la terminal
+    if secreto("DEBUG", "false").lower() == "true":      # en pantalla solo si tú lo activas
+        st.code(str(e))
 
 PASO = 10                                  # gramos por toque en + / −
 MONEDA = secreto("MONEDA", "S/")
@@ -285,7 +294,7 @@ def vista_cliente():
         return confirmacion(st.session_state.ultimo)
     try:
         productos = consultar("SELECT id, emoji, nombre, precio_kg, stock_g FROM productos "
-                              "WHERE activo AND stock_g > 0 ORDER BY nombre")
+                            "WHERE activo AND stock_g > 0 ORDER BY nombre")
         tamanos = [r[0] for r in consultar("SELECT gramos FROM presentaciones WHERE activo ORDER BY gramos")]
         empaques = {(t, g): float(p) for t, g, p in consultar(
             "SELECT tipo, gramos, precio FROM empaques WHERE activo AND stock > 0")}
@@ -294,8 +303,8 @@ def vista_cliente():
             "FROM recetas r JOIN receta_items i ON i.receta_id = r.id "
             "WHERE r.activo ORDER BY r.nombre, i.id")
     except Exception as e:
-        st.error("No se pudo conectar con la base de datos")
-        st.code(str(e))
+        mostrar_error(e)
+        st.error("Estamos teniendo un problema técnico. Intenta de nuevo en unos minutos.")
         return
     if not productos or not tamanos:
         st.info("Por ahora no hay productos disponibles.")
@@ -739,13 +748,19 @@ def vista_admin():
         return
         
     if not st.session_state.get("admin_ok"):
+        intentos = st.session_state.get("intentos", 0)
+        if intentos >= 5:
+            st.error("Demasiados intentos. Recarga la página en unos minutos.")
+            return
         with st.form("login"):
             intento = st.text_input("Contraseña de administrador", type="password")
             if st.form_submit_button("Entrar"):
-                if intento == ADMIN_CLAVE:
+                if hmac.compare_digest(intento.encode(), ADMIN_CLAVE.encode()):
                     st.session_state.admin_ok = True
+                    st.session_state.intentos = 0
                     st.rerun()
                 else:
+                    st.session_state.intentos = intentos + 1
                     st.error("Contraseña incorrecta.")
         return
     if st.button("Cerrar sesión"):
