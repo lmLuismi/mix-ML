@@ -3,7 +3,6 @@ from contextlib import contextmanager
 from decimal import Decimal as D, ROUND_HALF_UP
 
 import pandas as pd
-import psycopg2
 import streamlit as st
 
 import os
@@ -11,87 +10,81 @@ from zoneinfo import ZoneInfo
 import hmac
 import hashlib
 import time
-from psycopg2 import pool as pg_pool
 
-def secreto(nombre, defecto=""):
-    """Lee de .streamlit/secrets.toml (o de la plataforma en la nube)."""
-    try:
-        if nombre in st.secrets:
-            return str(st.secrets[nombre])
-    except Exception:
-        pass
-    return os.getenv(nombre, defecto)
+# ================= Configuración y Secretos nativos =================
+st.set_page_config(page_title="Mi Mix", page_icon="🥜")
+
+# Validación estricta y limpia de secretos
+if "DATABASE_URL" not in st.secrets:
+    st.error("❌ Falta configurar `DATABASE_URL` en tu archivo `.streamlit/secrets.toml` o en Streamlit Cloud.")
+    st.stop()
+
+DATABASE_URL = st.secrets["DATABASE_URL"]
+MONEDA = st.secrets.get("MONEDA", "S/")
+ADMIN_CLAVE = st.secrets.get("ADMIN_CLAVE", "")
+ADMIN_HASH = st.secrets.get("ADMIN_HASH", "")
+WHATSAPP = st.secrets.get("WHATSAPP_NUMERO", "")
+ZONA = st.secrets.get("ZONA_HORARIA", "UTC")
+DEBUG = str(st.secrets.get("DEBUG", "false")).lower() == "true"
+
+st.markdown("""
+<style>
+@media (max-width: 768px) {
+    div[data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; }
+}
+@media (min-width: 769px) {
+    div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; align-items: center; }
+}
+div[data-testid="stColumn"], div[data-testid="column"] { min-width: 0 !important; }
+.stButton > button { min-height: 46px; font-size: 1.1rem; }
+</style>
+""", unsafe_allow_html=True)
 
 import logging
 log = logging.getLogger("mix")
 
-
 def mostrar_error(e):
     log.exception("Error en la app")
-    if secreto("DEBUG", "false").lower() == "true":
+    if DEBUG:
         st.code(str(e))
 
-PASO = 10                                  # gramos por toque en + / −
-MONEDA = secreto("MONEDA", "S/")
-ADMIN_CLAVE = secreto("ADMIN_CLAVE")
-ADMIN_HASH = secreto("ADMIN_HASH")         # Hash SHA-256 opcional para mayor seguridad
-WHATSAPP = secreto("WHATSAPP_NUMERO")
-ZONA = secreto("ZONA_HORARIA", "UTC")
-
-
+PASO = 10
 ESTADOS = ["pendiente", "preparando", "entregado", "cancelado"]
 
-st.set_page_config(page_title="Mi Mix", page_icon="🥜")
-st.markdown("""
-<style>
-div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; align-items: center; }
-div[data-testid="stColumn"], div[data-testid="column"] { min-width: 0 !important; }
-.stButton > button { min-height: 46px; font-size: 1.2rem; }
-</style>
-""", unsafe_allow_html=True)
 
+# ================= Base de datos (Ultra rápido con st.connection) =================
+@st.cache_resource
+def get_conn():
+    return st.connection("postgresql", type="sql", url=DATABASE_URL)
 
-# ================= Base de datos =================
-@st.cache_resource(show_spinner=False)
-def pool_conexiones():
-    url = secreto("DATABASE_URL")
-    if not url:
-        raise RuntimeError("Falta DATABASE_URL en los secretos.")
-    return pg_pool.ThreadedConnectionPool(
-        1, 10, url, client_encoding="UTF8",
-        keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3)
+class CursorWrapper:
+    def __init__(self, session):
+        self.session = session
+        self._last_result = None
 
+    def execute(self, sql, params=None):
+        self._last_result = self.session.exec_driver_sql(sql, params or ())
+        return self
 
-def conexion_viva():
-    """Reutiliza una conexión abierta; si Neon la cerró, la reemplaza."""
-    p = pool_conexiones()
-    for _ in range(3):
-        conn = p.getconn()
-        try:
-            conn.cursor().execute("SELECT 1")
-            return conn
-        except (psycopg2.OperationalError, psycopg2.InterfaceError):
-            p.putconn(conn, close=True)
-    raise RuntimeError("No se pudo conectar con la base de datos.")
+    def fetchone(self):
+        return self._last_result.fetchone()
 
+    def fetchall(self):
+        return self._last_result.fetchall()
 
 @contextmanager
 def transaccion(escribe=False):
-    conn = conexion_viva()
-    try:
-        cur = conn.cursor()
-        yield cur
-        conn.commit()
-        if escribe:
-            st.cache_data.clear()      # si cambió algo, el caché se renueva
-    except Exception:
+    conn = get_conn()
+    with conn.session as s:
         try:
-            conn.rollback()
+            cur = CursorWrapper(s)
+            yield cur
+            if escribe:
+                s.commit()
+                st.cache_data.clear()
         except Exception:
-            pass
-        raise
-    finally:
-        pool_conexiones().putconn(conn, close=bool(conn.closed))
+            s.rollback()
+            raise
 
 
 def consultar(sql, params=None):
@@ -109,26 +102,28 @@ def dinero(x):
     return D(x).quantize(D("0.01"), ROUND_HALF_UP)
 
 
-def hora(d):  # fecha del servidor -> tu zona horaria
+def hora(d):
     return d.astimezone(ZoneInfo(ZONA)).strftime("%d/%m/%Y %H:%M")
 
 
-# ================= KARDEX (el corazón del sistema) =================
+# ================= KARDEX =================
 def mover(cur, item, iid, cant, motivo, costo=None, pedido_id=None, nota=None, nombre="el producto"):
-    """Único lugar donde cambia el stock. Actualiza saldo, costo promedio y escribe el kardex."""
     if item == "producto":
         cur.execute("SELECT stock_g, costo_kg/1000 FROM productos WHERE id=%s FOR UPDATE", (iid,))
     else:
         cur.execute("SELECT stock, costo FROM empaques WHERE id=%s FOR UPDATE", (iid,))
-    saldo, prom = cur.fetchone()
+    row = cur.fetchone()
+    if not row:
+        raise ValueError(f"No se encontró el ítem {nombre}.")
+    saldo, prom = row
     prom = D(prom)
     nuevo = saldo + cant
     if nuevo < 0:
         raise ValueError(f"No hay suficiente stock de {nombre}.")
-    if cant > 0 and costo is not None:               # entrada con costo: promedio ponderado
+    if cant > 0 and costo is not None:
         c_mov = D(costo)
         prom_nuevo = (D(saldo) * prom + D(cant) * c_mov) / D(nuevo)
-    else:                                            # salidas y ajustes: al costo promedio
+    else:
         c_mov, prom_nuevo = prom, prom
     if item == "producto":
         cur.execute("UPDATE productos SET stock_g=%s, costo_kg=%s WHERE id=%s", (nuevo, prom_nuevo * 1000, iid))
@@ -254,9 +249,8 @@ def restar(pid):
     else:
         st.session_state.mix[pid] = nuevo
 
-# ================= Información nutricional =================
+# ================= Nutrición y Catálogo =================
 PORCION_G = 30
-
 NUTRI_COLS = ["kcal_100g", "proteinas_100g", "grasas_100g", "grasas_sat_100g", "grasas_trans_100g",
               "colesterol_100g", "carbohidratos_100g", "azucares_100g", "fibra_100g", "sodio_100g"]
 NUTRI_ETQ = {
@@ -316,6 +310,7 @@ def catalogo():
     nutri = {f[0]: [float(v or 0) for v in f[1:]] for f in d["nutri"]}
     return productos, d["tamanos"], empaques, [tuple(f) for f in d["recetas"]], nutri
 
+
 # ================= Vista del cliente =================
 def confirmacion(u):
     st.title("¡Pedido recibido! 🎉")
@@ -370,16 +365,8 @@ def vista_cliente():
     if st.session_state.get("ultimo"):
         return confirmacion(st.session_state.ultimo)   
     try:
-        t0 = time.perf_counter()
         productos, tamanos, empaques, filas_rec, nutri = catalogo()
-        t_cat = time.perf_counter() - t0
     except Exception as e:
-        if secreto("DEBUG", "false").lower() == "true":
-            t = time.perf_counter()
-        with transaccion() as cur:
-            cur.execute("SELECT 1")
-        st.caption(f"⏱ Ida y vuelta a la base: {(time.perf_counter() - t) * 1000:.0f} ms · "
-                   f"Catálogo: {t_cat:.2f} s")
         mostrar_error(e)
         st.error("Estamos teniendo un problema técnico. Intenta de nuevo en unos minutos.")
         return
@@ -451,7 +438,7 @@ def vista_cliente():
                 st.rerun()
 
 
-# ================= Administrador Optimizado con Fragmentos =================
+# ================= Administrador =================
 @st.cache_data(ttl=30)
 def items_inventario():
     prods = consultar("SELECT id, emoji, nombre, stock_g, costo_kg FROM productos ORDER BY nombre")
@@ -801,7 +788,6 @@ def tab_receta():
 
 
 def verificar_clave(intento):
-    """Valida la contraseña de forma segura usando hash SHA-256 o texto plano si ADMIN_HASH no está definido."""
     intento_hash = hashlib.sha256(intento.encode("utf-8")).hexdigest()
     if ADMIN_HASH:
         return hmac.compare_digest(intento_hash.encode("utf-8"), ADMIN_HASH.encode("utf-8"))
