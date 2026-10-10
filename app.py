@@ -320,13 +320,13 @@ def catalogo():
 # ================= Vista del cliente =================
 def confirmacion(u):
     st.title("¡Pedido recibido! 🎉")
-    st.success(f"Pedido #{u['id']} · {u['gramos']} g · Total {MONEDA}{u['total']:.2f}")
+    st.success(f"{u['gramos']} g · Total {MONEDA}{u['total']:.2f}")
     for nom, g, sub in u["lineas"]:
         st.write(f"**{nom}** — {g} g · {MONEDA}{sub:.2f}")
     st.write(f"Empaque {u['empaque']} — {MONEDA}{u['precio_emp']:.2f}")
     if WHATSAPP:
         detalle = "\n".join(f"- {n}: {g} g" for n, g, _ in u["lineas"])
-        msg = (f"Hola, soy {u['nombre']}. Pedido #{u['id']} (mix de {u['gramos']} g, "
+        msg = (f"Hola, soy {u['nombre']}. (mix de {u['gramos']} g, "
                f"empaque {u['empaque']}):\n{detalle}\nTotal: {MONEDA}{u['total']:.2f}")
         st.link_button("Enviar por WhatsApp", f"https://wa.me/{WHATSAPP}?text={urllib.parse.quote(msg)}",
                        use_container_width=True, type="primary")
