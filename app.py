@@ -294,7 +294,7 @@ def tabla_nutricional(mix, usado, datos):
         "<small>Valores calculados según los productos de tu mix.</small></div>",
         unsafe_allow_html=True)
 
-@st.cache_data(ttl=60, show_spinner="Cargando tu mix…")
+@st.cache_data(ttl=300, show_spinner="Cargando tu mix…")
 def catalogo():
     with transaccion() as cur:
         cur.execute("SELECT id, emoji, nombre, precio_kg, stock_g FROM productos "
@@ -329,6 +329,38 @@ def confirmacion(u):
         st.session_state.ultimo = None
         st.rerun()
 
+@st.fragment
+def armador(productos, tope, tipo, precio_empaque, nutri):
+    st.subheader("Productos")
+    if st.session_state.mix:
+        st.button("🗑️ Vaciar mi mix", on_click=vaciar)
+
+    for pid, emoji, nombre, precio_kg, stock in productos:
+        gramos = st.session_state.mix.get(pid, 0)
+        c1, c2, c3, c4 = st.columns([4, 1.3, 1.8, 1.3])
+        c1.markdown(f"{emoji} **{nombre}**  \n{MONEDA}{float(precio_kg):.2f} /kg")
+        c2.button("−", key=f"m{pid}", on_click=restar, args=(pid,), disabled=gramos == 0,
+                  use_container_width=True)
+        c3.markdown(f"**{gramos} g**")
+        c4.button("+", key=f"p{pid}", on_click=sumar, args=(pid, stock),
+                  disabled=total_usado() + PASO > tope or gramos + PASO > stock,
+                  use_container_width=True)
+
+    usado = total_usado()
+    precios = {pid: float(pk) for pid, _, _, pk, _ in productos}
+    subtotal_mix = sum(g * precios[pid] / 1000 for pid, g in st.session_state.mix.items() if pid in precios)
+    total = subtotal_mix + precio_empaque
+
+    st.divider()
+    st.progress(usado / tope)
+    if usado == tope:
+        st.success(f"¡Mix completo! {usado} / {tope} g")
+    else:
+        st.write(f"**{usado} / {tope} g** · faltan {tope - usado} g")
+    st.write(f"Mix: {MONEDA}{subtotal_mix:.2f} · Empaque {tipo}: {MONEDA}{precio_empaque:.2f}")
+    st.subheader(f"Total: {MONEDA}{total:.2f}")
+    if usado > 0:
+        tabla_nutricional(st.session_state.mix, usado, nutri)
 
 def vista_cliente():
     if st.session_state.get("ultimo"):
@@ -378,43 +410,19 @@ def vista_cliente():
             st.caption((r["desc"] + " — " if r["desc"] else "") + comp)
         st.caption("Elige uno y, si quieres, ajústalo con + y −.")
 
-    st.subheader("Productos")
-    if st.session_state.mix:
-        st.button("🗑️ Vaciar mi mix", on_click=vaciar)
+    armador(productos, tope, tipo, precio_empaque, nutri)
 
-    for pid, emoji, nombre, precio_kg, stock in productos:
-        gramos = st.session_state.mix.get(pid, 0)
-        c1, c2, c3, c4 = st.columns([4, 1.3, 1.8, 1.3])
-        c1.markdown(f"{emoji} **{nombre}**  \n{MONEDA}{float(precio_kg):.2f} /kg")
-        c2.button("−", key=f"m{pid}", on_click=restar, args=(pid,), disabled=gramos == 0,
-                  use_container_width=True)
-        c3.markdown(f"**{gramos} g**")
-        c4.button("+", key=f"p{pid}", on_click=sumar, args=(pid, stock),
-                  disabled=total_usado() + PASO > tope or gramos + PASO > stock, use_container_width=True)
 
-    usado = total_usado()
-    precios = {pid: float(pk) for pid, _, _, pk, _ in productos}
-    subtotal_mix = sum(g * precios[pid] / 1000 for pid, g in st.session_state.mix.items() if pid in precios)
-    total = subtotal_mix + precio_empaque
-
-    st.divider()
-    st.progress(usado / tope)
-    if usado == tope:
-        st.success(f"¡Mix completo! {usado} / {tope} g")
-    else:
-        st.write(f"**{usado} / {tope} g** · faltan {tope - usado} g")
-    st.write(f"Mix: {MONEDA}{subtotal_mix:.2f} · Empaque {tipo}: {MONEDA}{precio_empaque:.2f}")
-    st.subheader(f"Total: {MONEDA}{total:.2f}")
-    if usado > 0:
-        tabla_nutricional(st.session_state.mix, usado, nutri)
-
-    if usado > 0:
-        with st.form("pedido"):
+    with st.form("pedido"):
             nombre = st.text_input("Tu nombre")
             tel = st.text_input("Tu celular (WhatsApp)")
             enviar = st.form_submit_button("Confirmar pedido", type="primary", use_container_width=True)
-        if enviar:
+    if enviar:
+        if not st.session_state.mix:
+            st.error("Agrega al menos un producto a tu mix.")
+        elif len(nombre.strip()) < 2:
             resultado = None
+
             if len(nombre.strip()) < 2:
                 st.error("Escribe tu nombre.")
             elif len("".join(c for c in tel if c.isdigit())) < 7:
