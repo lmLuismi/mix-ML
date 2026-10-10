@@ -3,88 +3,93 @@ from contextlib import contextmanager
 from decimal import Decimal as D, ROUND_HALF_UP
 
 import pandas as pd
+import psycopg2
 import streamlit as st
 
 import os
 from zoneinfo import ZoneInfo
 import hmac
-import hashlib
-import time
 
-# ================= Configuración y Secretos nativos =================
-st.set_page_config(page_title="Mi Mix", page_icon="🥜")
+from psycopg2 import pool as pg_pool
 
-# Validación estricta y limpia de secretos
-if "DATABASE_URL" not in st.secrets:
-    st.error("❌ Falta configurar `DATABASE_URL` en tu archivo `.streamlit/secrets.toml` o en Streamlit Cloud.")
-    st.stop()
-
-DATABASE_URL = st.secrets["DATABASE_URL"]
-MONEDA = st.secrets.get("MONEDA", "S/")
-ADMIN_CLAVE = st.secrets.get("ADMIN_CLAVE", "")
-ADMIN_HASH = st.secrets.get("ADMIN_HASH", "")
-WHATSAPP = st.secrets.get("WHATSAPP_NUMERO", "")
-ZONA = st.secrets.get("ZONA_HORARIA", "UTC")
-DEBUG = str(st.secrets.get("DEBUG", "false")).lower() == "true"
-
-st.markdown("""
-<style>
-@media (max-width: 768px) {
-    div[data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; }
-}
-@media (min-width: 769px) {
-    div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; align-items: center; }
-}
-div[data-testid="stColumn"], div[data-testid="column"] { min-width: 0 !important; }
-.stButton > button { min-height: 46px; font-size: 1.1rem; }
-</style>
-""", unsafe_allow_html=True)
+def secreto(nombre, defecto=""):
+    """Lee de .streamlit/secrets.toml (o de la plataforma en la nube)."""
+    try:
+        if nombre in st.secrets:
+            return str(st.secrets[nombre])
+    except Exception:
+        pass
+    return os.getenv(nombre, defecto)
 
 import logging
 log = logging.getLogger("mix")
 
+
 def mostrar_error(e):
-    log.exception("Error en la app")
-    if DEBUG:
+    log.exception("Error en la app")                     # queda en la terminal
+    if secreto("DEBUG", "false").lower() == "true":      # en pantalla solo si tú lo activas
         st.code(str(e))
 
-PASO = 10
+PASO = 10                                  # gramos por toque en + / −
+MONEDA = secreto("MONEDA", "S/")
+ADMIN_CLAVE = secreto("ADMIN_CLAVE")
+WHATSAPP = secreto("WHATSAPP_NUMERO")
+ZONA = secreto("ZONA_HORARIA", "UTC")
+
+
 ESTADOS = ["pendiente", "preparando", "entregado", "cancelado"]
 
+st.set_page_config(page_title="Mi Mix", page_icon="🥜")
+st.markdown("""
+<style>
+div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; align-items: center; }
+div[data-testid="stColumn"], div[data-testid="column"] { min-width: 0 !important; }
+.stButton > button { min-height: 46px; font-size: 1.2rem; }
+</style>
+""", unsafe_allow_html=True)
 
-# ================= Base de datos (Ultra rápido con st.connection) =================
-@st.cache_resource
-def get_conn():
-    return st.connection("postgresql", type="sql", url=DATABASE_URL)
 
-class CursorWrapper:
-    def __init__(self, session):
-        self.session = session
-        self._last_result = None
+# ================= Base de datos =================
+@st.cache_resource(show_spinner=False)
+def pool_conexiones():
+    url = secreto("DATABASE_URL")
+    if not url:
+        raise RuntimeError("Falta DATABASE_URL en los secretos.")
+    return pg_pool.ThreadedConnectionPool(
+        1, 10, url, client_encoding="UTF8",
+        keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3)
 
-    def execute(self, sql, params=None):
-        self._last_result = self.session.exec_driver_sql(sql, params or ())
-        return self
 
-    def fetchone(self):
-        return self._last_result.fetchone()
+def conexion_viva():
+    """Reutiliza una conexión abierta; si Neon la cerró, la reemplaza."""
+    p = pool_conexiones()
+    for _ in range(3):
+        conn = p.getconn()
+        try:
+            conn.cursor().execute("SELECT 1")
+            return conn
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            p.putconn(conn, close=True)
+    raise RuntimeError("No se pudo conectar con la base de datos.")
 
-    def fetchall(self):
-        return self._last_result.fetchall()
 
 @contextmanager
 def transaccion(escribe=False):
-    conn = get_conn()
-    with conn.session as s:
+    conn = conexion_viva()
+    try:
+        cur = conn.cursor()
+        yield cur
+        conn.commit()
+        if escribe:
+            st.cache_data.clear()      # si cambió algo, el caché se renueva
+    except Exception:
         try:
-            cur = CursorWrapper(s)
-            yield cur
-            if escribe:
-                s.commit()
-                st.cache_data.clear()
+            conn.rollback()
         except Exception:
-            s.rollback()
-            raise
+            pass
+        raise
+    finally:
+        pool_conexiones().putconn(conn, close=bool(conn.closed))
 
 
 def consultar(sql, params=None):
@@ -102,28 +107,28 @@ def dinero(x):
     return D(x).quantize(D("0.01"), ROUND_HALF_UP)
 
 
-def hora(d):
+def hora(d):  # fecha del servidor -> tu zona horaria
     return d.astimezone(ZoneInfo(ZONA)).strftime("%d/%m/%Y %H:%M")
 
 
-# ================= KARDEX =================
+# ================= KARDEX (el corazón del sistema) =================
 def mover(cur, item, iid, cant, motivo, costo=None, pedido_id=None, nota=None, nombre="el producto"):
+    """Único lugar donde cambia el stock. Actualiza saldo, costo promedio y escribe el kardex.
+    item: 'producto' (cantidad en gramos) o 'empaque' (unidades). cant con signo.
+    costo: por gramo o por unidad (solo en entradas). Devuelve el costo unitario usado."""
     if item == "producto":
         cur.execute("SELECT stock_g, costo_kg/1000 FROM productos WHERE id=%s FOR UPDATE", (iid,))
     else:
         cur.execute("SELECT stock, costo FROM empaques WHERE id=%s FOR UPDATE", (iid,))
-    row = cur.fetchone()
-    if not row:
-        raise ValueError(f"No se encontró el ítem {nombre}.")
-    saldo, prom = row
+    saldo, prom = cur.fetchone()
     prom = D(prom)
     nuevo = saldo + cant
     if nuevo < 0:
         raise ValueError(f"No hay suficiente stock de {nombre}.")
-    if cant > 0 and costo is not None:
+    if cant > 0 and costo is not None:               # entrada con costo: promedio ponderado
         c_mov = D(costo)
         prom_nuevo = (D(saldo) * prom + D(cant) * c_mov) / D(nuevo)
-    else:
+    else:                                            # salidas y ajustes: al costo promedio
         c_mov, prom_nuevo = prom, prom
     if item == "producto":
         cur.execute("UPDATE productos SET stock_g=%s, costo_kg=%s WHERE id=%s", (nuevo, prom_nuevo * 1000, iid))
@@ -193,8 +198,8 @@ def cancelar_pedido(pid):
 
 # ================= Estado del mix =================
 st.session_state.setdefault("mix", {})
-st.session_state.setdefault("receta_items", None)
-st.session_state.setdefault("stock_de", {})
+st.session_state.setdefault("receta_items", None)   # receta aplicada: [(producto_id, gramos por 1000 g)]
+st.session_state.setdefault("stock_de", {})         # {producto_id: stock en gramos}
 
 
 def total_usado():
@@ -202,13 +207,14 @@ def total_usado():
 
 
 def escalar_receta(items, tope, stock_de):
+    """Reparte el tope entre los productos de la receta, en pasos de PASO g y llenando el tope."""
     total = sum(g for _, g in items)
     exactos = {pid: tope * g / total for pid, g in items}
     mix = {pid: int(x // PASO) * PASO for pid, x in exactos.items()}
     resto = tope - sum(mix.values())
     orden = sorted(exactos, key=lambda p: exactos[p] - mix[p], reverse=True)
     i = 0
-    while resto >= PASO and orden:
+    while resto >= PASO and orden:                      # reparte lo que sobró
         mix[orden[i % len(orden)]] += PASO
         resto -= PASO
         i += 1
@@ -222,7 +228,7 @@ def aplicar_receta(items):
 
 
 def cambiar_tamano():
-    if st.session_state.receta_items:
+    if st.session_state.receta_items:                   # si eligió un mix listo, se reescala
         aplicar_receta(st.session_state.receta_items)
     elif total_usado() > st.session_state.tope:
         st.session_state.mix = {}
@@ -249,8 +255,9 @@ def restar(pid):
     else:
         st.session_state.mix[pid] = nuevo
 
-# ================= Nutrición y Catálogo =================
-PORCION_G = 30
+# ================= Información nutricional =================
+PORCION_G = 30     # tamaño de porción de la etiqueta (g)
+
 NUTRI_COLS = ["kcal_100g", "proteinas_100g", "grasas_100g", "grasas_sat_100g", "grasas_trans_100g",
               "colesterol_100g", "carbohidratos_100g", "azucares_100g", "fibra_100g", "sodio_100g"]
 NUTRI_ETQ = {
@@ -259,7 +266,7 @@ NUTRI_ETQ = {
     "colesterol_100g": "Colesterol (mg)", "carbohidratos_100g": "Hidratos de carbono disponibles (g)",
     "azucares_100g": "Azúcares totales (g)", "fibra_100g": "Fibra (g)", "sodio_100g": "Sodio (mg)",
 }
-NUTRI_SUB = {"grasas_sat_100g", "grasas_trans_100g", "azucares_100g"}
+NUTRI_SUB = {"grasas_sat_100g", "grasas_trans_100g", "azucares_100g"}   # filas con sangría
 
 
 def num(x):
@@ -289,27 +296,21 @@ def tabla_nutricional(mix, usado, datos):
 
 @st.cache_data(ttl=300, show_spinner="Cargando tu mix…")
 def catalogo():
-    cols = ", ".join(NUTRI_COLS)
     with transaccion() as cur:
-        cur.execute(f"""
-            SELECT json_build_object(
-              'productos', (SELECT COALESCE(json_agg(json_build_array(id, emoji, nombre, precio_kg, stock_g)
-                              ORDER BY nombre), '[]'::json) FROM productos WHERE activo AND stock_g > 0),
-              'tamanos',   (SELECT COALESCE(json_agg(gramos ORDER BY gramos), '[]'::json)
-                              FROM presentaciones WHERE activo),
-              'empaques',  (SELECT COALESCE(json_agg(json_build_array(tipo, gramos, precio)), '[]'::json)
-                              FROM empaques WHERE activo AND stock > 0),
-              'recetas',   (SELECT COALESCE(json_agg(json_build_array(r.id, r.emoji, r.nombre, r.descripcion,
-                              i.producto_id, i.gramos) ORDER BY r.nombre, i.id), '[]'::json)
-                              FROM recetas r JOIN receta_items i ON i.receta_id = r.id WHERE r.activo),
-              'nutri',     (SELECT COALESCE(json_agg(json_build_array(id, {cols})), '[]'::json) FROM productos)
-            )""")
-        d = cur.fetchone()[0]
-    productos = [tuple(f) for f in d["productos"]]
-    empaques = {(t, g): float(p) for t, g, p in d["empaques"]}
-    nutri = {f[0]: [float(v or 0) for v in f[1:]] for f in d["nutri"]}
-    return productos, d["tamanos"], empaques, [tuple(f) for f in d["recetas"]], nutri
-
+        cur.execute("SELECT id, emoji, nombre, precio_kg, stock_g FROM productos "
+                    "WHERE activo AND stock_g > 0 ORDER BY nombre")
+        productos = cur.fetchall()
+        cur.execute("SELECT gramos FROM presentaciones WHERE activo ORDER BY gramos")
+        tamanos = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT tipo, gramos, precio FROM empaques WHERE activo AND stock > 0")
+        empaques = {(t, g): float(p) for t, g, p in cur.fetchall()}
+        cur.execute("SELECT r.id, r.emoji, r.nombre, r.descripcion, i.producto_id, i.gramos "
+                    "FROM recetas r JOIN receta_items i ON i.receta_id = r.id "
+                    "WHERE r.activo ORDER BY r.nombre, i.id")
+        filas_rec = cur.fetchall()
+        cur.execute("SELECT id, " + ", ".join(NUTRI_COLS) + " FROM productos")
+        nutri = {f[0]: [float(v or 0) for v in f[1:]] for f in cur.fetchall()}
+    return productos, tamanos, empaques, filas_rec, nutri
 
 # ================= Vista del cliente =================
 def confirmacion(u):
@@ -363,7 +364,7 @@ def armador(productos, tope, tipo, precio_empaque, nutri):
 
 def vista_cliente():
     if st.session_state.get("ultimo"):
-        return confirmacion(st.session_state.ultimo)   
+        return  confirmacion(st.session_state.ultimo)   
     try:
         productos, tamanos, empaques, filas_rec, nutri = catalogo()
     except Exception as e:
@@ -396,6 +397,7 @@ def vista_cliente():
     for rid, emo, nom, desc, pid, g in filas_rec:
         r = recetas.setdefault(rid, {"emoji": emo, "nombre": nom, "desc": desc, "items": []})
         r["items"].append((pid, g))
+    # solo se muestran los mixes cuyos productos están todos disponibles
     recetas = {k: r for k, r in recetas.items() if all(p in nombre_de for p, _ in r["items"])}
 
     if recetas:
@@ -410,15 +412,17 @@ def vista_cliente():
 
     armador(productos, tope, tipo, precio_empaque, nutri)
 
+
     with st.form("pedido"):
-        nombre = st.text_input("Tu nombre")
-        tel = st.text_input("Tu celular (WhatsApp)")
-        enviar = st.form_submit_button("Confirmar pedido", type="primary", use_container_width=True)
+            nombre = st.text_input("Tu nombre")
+            tel = st.text_input("Tu celular (WhatsApp)")
+            enviar = st.form_submit_button("Confirmar pedido", type="primary", use_container_width=True)
     if enviar:
         if not st.session_state.mix:
             st.error("Agrega al menos un producto a tu mix.")
-        else:
+        elif len(nombre.strip()) < 2:
             resultado = None
+
             if len(nombre.strip()) < 2:
                 st.error("Escribe tu nombre.")
             elif len("".join(c for c in tel if c.isdigit())) < 7:
@@ -436,10 +440,9 @@ def vista_cliente():
                 st.session_state.mix = {}
                 st.session_state.receta_items = None
                 st.rerun()
-
+    
 
 # ================= Administrador =================
-@st.cache_data(ttl=30)
 def items_inventario():
     prods = consultar("SELECT id, emoji, nombre, stock_g, costo_kg FROM productos ORDER BY nombre")
     emps = consultar("SELECT id, tipo, gramos, stock, costo FROM empaques ORDER BY tipo, gramos")
@@ -448,7 +451,6 @@ def items_inventario():
     return items
 
 
-@st.fragment
 def tab_pedidos():
     filas = consultar("SELECT id, creado_en, cliente_nombre, cliente_telefono, presentacion_g, empaque_tipo, "
                       "total, costo_total, estado FROM pedidos ORDER BY id DESC LIMIT 100")
@@ -469,14 +471,13 @@ def tab_pedidos():
         if actual == "cancelado":
             st.error("Un pedido cancelado no se puede reactivar. Crea uno nuevo.")
         elif nuevo == "cancelado":
-            cancelar_pedido(int(pid))
+            cancelar_pedido(int(pid))      # devuelve el stock y deja el rastro en el kardex
             st.rerun()
         else:
             ejecutar("UPDATE pedidos SET estado=%s WHERE id=%s", (nuevo, int(pid)))
             st.rerun()
 
 
-@st.fragment
 def tab_kardex():
     items = items_inventario()
     i = st.selectbox("Ver kardex de", range(len(items)), format_func=lambda k: items[k][2], key="kx")
@@ -510,7 +511,6 @@ def tab_kardex():
                        file_name=f"kardex_{etq}.csv", mime="text/csv")
 
 
-@st.fragment
 def tab_inventario():
     items = items_inventario()
     filas, valor_total, sin_costo = [], D(0), False
@@ -525,15 +525,16 @@ def tab_inventario():
                       "Costo promedio": f"{MONEDA}{float(costo):.2f}/{u}", "Valor": f"{MONEDA}{float(valor):.2f}"})
     st.metric("Valor del inventario", f"{MONEDA}{float(valor_total):,.2f}")
     if sin_costo:
-        st.warning("Hay ítems con costo 0: tu ganancia saldrá inflada. Corrige el costo en Precios o registra una compra.")
+        st.warning("Hay ítems con costo 0: tu ganancia saldrá inflada. Corrige el costo en la pestaña Precios "
+                   "o registra una compra con su costo.")
     st.dataframe(pd.DataFrame(filas), hide_index=True, use_container_width=True)
 
     st.subheader("Registrar movimiento")
-    i = st.selectbox("Ítem", range(len(items)), format_func=lambda k: items[k][2], key="mov_item")
+    i = st.selectbox("Ítem", range(len(items)), format_func=lambda k: items[k][2])
     tipo, iid, etq, _, _ = items[i]
     es_prod = tipo == "producto"
     modo = st.radio("Movimiento", ["Compra (entra)", "Merma (sale)", "Conteo: sumar", "Conteo: restar"],
-                    horizontal=True, key="mov_modo")
+                    horizontal=True)
     with st.form("mov", clear_on_submit=True):
         cant = st.number_input("Cantidad en kg" if es_prod else "Cantidad en unidades",
                                min_value=0.0, step=0.5 if es_prod else 1.0)
@@ -558,7 +559,6 @@ def tab_inventario():
                     st.error(str(e))
 
 
-@st.fragment
 def tab_precios():
     st.caption("El stock no se edita aquí: se mueve desde Inventario para que el kardex siempre cuadre.")
     st.subheader("Productos")
@@ -569,6 +569,7 @@ def tab_precios():
                         column_config={"precio_kg": st.column_config.NumberColumn("Precio venta/kg", min_value=0.0, format="%.2f"),
                                        "costo_kg": st.column_config.NumberColumn("Costo/kg", min_value=0.0, format="%.2f"),
                                        "activo": st.column_config.CheckboxColumn("Activo")})
+    st.caption("El costo se actualiza solo con cada compra. Edítalo únicamente para corregir el costo inicial.")
     if st.button("Guardar productos", type="primary"):
         for r in ed.to_dict("records"):
             ejecutar("UPDATE productos SET emoji=%s, nombre=%s, precio_kg=%s, costo_kg=%s, activo=%s WHERE id=%s",
@@ -593,13 +594,13 @@ def tab_precios():
     df = pd.DataFrame(consultar("SELECT id, tipo, gramos, precio, costo, activo FROM empaques ORDER BY tipo, gramos"),
                       columns=["id", "tipo", "gramos", "precio", "costo", "activo"])
     df[["precio", "costo"]] = df[["precio", "costo"]].astype(float)
-    ed_emp = st.data_editor(df, hide_index=True, use_container_width=True, disabled=["id", "tipo", "gramos"],
+    ed = st.data_editor(df, hide_index=True, use_container_width=True, disabled=["id", "tipo", "gramos"],
                         key="ed_emp",
                         column_config={"precio": st.column_config.NumberColumn("Precio venta", min_value=0.0, format="%.2f"),
                                        "costo": st.column_config.NumberColumn("Costo unidad", min_value=0.0, format="%.2f"),
                                        "activo": st.column_config.CheckboxColumn("Activo")})
     if st.button("Guardar empaques", type="primary"):
-        for r in ed_emp.to_dict("records"):
+        for r in ed.to_dict("records"):
             ejecutar("UPDATE empaques SET precio=%s, costo=%s, activo=%s WHERE id=%s",
                      (float(r["precio"]), float(r["costo"]), bool(r["activo"]), int(r["id"])))
         st.success("Empaques guardados.")
@@ -616,11 +617,7 @@ def tab_precios():
                 except Exception:
                     st.error("Ese tipo ya existe para ese tamaño.")
 
-    st.divider()
-    tab_nutricion()
 
-
-@st.fragment
 def tab_ventas():
     filas = []
     for etiqueta, unidad in [("Hoy", "day"), ("Este mes", "month"), ("Total", None)]:
@@ -646,9 +643,9 @@ def tab_ventas():
     else:
         st.info("Aún no hay ventas.")
 
-
 def tab_nutricion():
     st.subheader("Información nutricional (por 100 g)")
+    st.caption("Escribe los valores de la etiqueta de cada producto. Con eso la app calcula la tabla del mix.")
     cols = ["id", "nombre"] + NUTRI_COLS
     df = pd.DataFrame(consultar("SELECT " + ", ".join(cols) + " FROM productos ORDER BY nombre"), columns=cols)
     df[NUTRI_COLS] = df[NUTRI_COLS].astype(float)
@@ -682,7 +679,7 @@ def recetas_guardadas(base):
     st.subheader("Recetas guardadas")
     recetas = consultar("SELECT id, emoji, nombre, descripcion, activo FROM recetas ORDER BY nombre")
     if not recetas:
-        st.info("Aún no guardaste recetas.")
+        st.info("Aún no guardaste recetas. Arma una arriba y toca «Guardar receta».")
         return
     info = base.set_index("id")
     for rid, emoji, nombre, desc, activo in recetas:
@@ -718,9 +715,9 @@ def recetas_guardadas(base):
                 st.rerun()
 
 
-@st.fragment
 def tab_receta():
     st.subheader("Calculadora de receta (por 1000 g)")
+    st.caption("Escribe los gramos de cada producto. Si no suman 1000 g, se ajusta proporcionalmente.")
     cols = ["id", "emoji", "nombre", "precio_kg", "costo_kg"] + NUTRI_COLS
     base = pd.DataFrame(consultar("SELECT " + ", ".join(cols) + " FROM productos WHERE activo ORDER BY nombre"),
                         columns=cols)
@@ -786,19 +783,9 @@ def tab_receta():
 
     recetas_guardadas(base)
 
-
-def verificar_clave(intento):
-    intento_hash = hashlib.sha256(intento.encode("utf-8")).hexdigest()
-    if ADMIN_HASH:
-        return hmac.compare_digest(intento_hash.encode("utf-8"), ADMIN_HASH.encode("utf-8"))
-    elif ADMIN_CLAVE:
-        return hmac.compare_digest(intento.encode("utf-8"), ADMIN_CLAVE.encode("utf-8"))
-    return False
-
-
 def vista_admin():
-    if not ADMIN_CLAVE and not ADMIN_HASH:
-        st.warning("Falta configurar ADMIN_CLAVE o ADMIN_HASH en los secretos.")
+    if not ADMIN_CLAVE:
+        st.warning("Falta configurar ADMIN_CLAVE en los secretos.")
         return
         
     if not st.session_state.get("admin_ok"):
@@ -809,7 +796,7 @@ def vista_admin():
         with st.form("login"):
             intento = st.text_input("Contraseña de administrador", type="password")
             if st.form_submit_button("Entrar"):
-                if verificar_clave(intento):
+                if hmac.compare_digest(intento.encode(), ADMIN_CLAVE.encode()):
                     st.session_state.admin_ok = True
                     st.session_state.intentos = 0
                     st.rerun()
@@ -817,11 +804,9 @@ def vista_admin():
                     st.session_state.intentos = intentos + 1
                     st.error("Contraseña incorrecta.")
         return
-    
     if st.button("Cerrar sesión"):
         st.session_state.admin_ok = False
         st.rerun()
-
     t1, t2, t3, t4, t5, t6 = st.tabs(["📋 Pedidos", "📚 Kardex", "📦 Inventario", "💲 Precios", "📈 Ventas", "🧮 Receta 1 kg"])    
     with t1:
         tab_pedidos()
@@ -831,11 +816,12 @@ def vista_admin():
         tab_inventario()
     with t4:
         tab_precios()
+        st.divider()
+        tab_nutricion()
     with t5:
         tab_ventas()
     with t6:
         tab_receta()
-
 
 tab_cliente, tab_admin = st.tabs(["🥜 Mi mix", "🔐 Admin"])
 with tab_cliente:
