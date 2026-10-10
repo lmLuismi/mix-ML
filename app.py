@@ -10,6 +10,7 @@ import os
 from zoneinfo import ZoneInfo
 import hmac
 
+from psycopg2 import pool as pg_pool
 
 def secreto(nombre, defecto=""):
     """Lee de .streamlit/secrets.toml (o de la plataforma en la nube)."""
@@ -49,21 +50,46 @@ div[data-testid="stColumn"], div[data-testid="column"] { min-width: 0 !important
 
 
 # ================= Base de datos =================
-@contextmanager
-def transaccion():
+@st.cache_resource(show_spinner=False)
+def pool_conexiones():
     url = secreto("DATABASE_URL")
     if not url:
         raise RuntimeError("Falta DATABASE_URL en los secretos.")
-    conn = psycopg2.connect(url, client_encoding="UTF8")
+    return pg_pool.ThreadedConnectionPool(
+        1, 10, url, client_encoding="UTF8",
+        keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3)
+
+
+def conexion_viva():
+    """Reutiliza una conexión abierta; si Neon la cerró, la reemplaza."""
+    p = pool_conexiones()
+    for _ in range(3):
+        conn = p.getconn()
+        try:
+            conn.cursor().execute("SELECT 1")
+            return conn
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            p.putconn(conn, close=True)
+    raise RuntimeError("No se pudo conectar con la base de datos.")
+
+
+@contextmanager
+def transaccion(escribe=False):
+    conn = conexion_viva()
     try:
         cur = conn.cursor()
         yield cur
         conn.commit()
+        if escribe:
+            st.cache_data.clear()      # si cambió algo, el caché se renueva
     except Exception:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         raise
     finally:
-        conn.close()
+        pool_conexiones().putconn(conn, close=bool(conn.closed))
 
 
 def consultar(sql, params=None):
@@ -73,7 +99,7 @@ def consultar(sql, params=None):
 
 
 def ejecutar(sql, params=None):
-    with transaccion() as cur:
+    with transaccion(escribe=True) as cur:
         cur.execute(sql, params)
 
 
@@ -121,7 +147,7 @@ def crear_pedido(nombre, tel, tope, tipo, mix):
         raise ValueError("Agrega al menos un producto.")
     if sum(mix.values()) > tope:
         raise ValueError(f"Tu mix supera el máximo de {tope} g.")
-    with transaccion() as cur:
+    with transaccion(escribe=True) as cur:
         cur.execute("SELECT id, precio FROM empaques WHERE tipo=%s AND gramos=%s AND activo", (tipo, tope))
         emp = cur.fetchone()
         if not emp:
@@ -156,7 +182,7 @@ def crear_pedido(nombre, tel, tope, tipo, mix):
 
 
 def cancelar_pedido(pid):
-    with transaccion() as cur:
+    with transaccion(escribe=True) as cur:
         cur.execute("SELECT estado, empaque_id, costo_empaque FROM pedidos WHERE id=%s FOR UPDATE", (pid,))
         estado, emp_id, c_emp = cur.fetchone()
         if estado == "cancelado":
@@ -247,12 +273,9 @@ def num(x):
     return f"{x:.1f}".rstrip("0").rstrip(".")
 
 
-def tabla_nutricional(mix, usado):
-    filas = consultar("SELECT id, " + ", ".join(NUTRI_COLS) + " FROM productos WHERE id = ANY(%s)",
-                      (list(mix),))
-    datos = {fila[0]: [float(v or 0) for v in fila[1:]] for fila in filas}
+def tabla_nutricional(mix, usado, datos):
     por100 = [sum(g * datos[pid][i] for pid, g in mix.items() if pid in datos) / usado
-              for i in range(len(NUTRI_COLS))]
+            for i in range(len(NUTRI_COLS))]
     factor = PORCION_G / 100
     celdas = ""
     for i, col in enumerate(NUTRI_COLS):
@@ -270,6 +293,24 @@ def tabla_nutricional(mix, usado):
         f"<table><tr><th></th><th>100 g</th><th>1 porción</th></tr>{celdas}</table>"
         "<small>Valores calculados según los productos de tu mix.</small></div>",
         unsafe_allow_html=True)
+
+@st.cache_data(ttl=60, show_spinner="Cargando tu mix…")
+def catalogo():
+    with transaccion() as cur:
+        cur.execute("SELECT id, emoji, nombre, precio_kg, stock_g FROM productos "
+                    "WHERE activo AND stock_g > 0 ORDER BY nombre")
+        productos = cur.fetchall()
+        cur.execute("SELECT gramos FROM presentaciones WHERE activo ORDER BY gramos")
+        tamanos = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT tipo, gramos, precio FROM empaques WHERE activo AND stock > 0")
+        empaques = {(t, g): float(p) for t, g, p in cur.fetchall()}
+        cur.execute("SELECT r.id, r.emoji, r.nombre, r.descripcion, i.producto_id, i.gramos "
+                    "FROM recetas r JOIN receta_items i ON i.receta_id = r.id "
+                    "WHERE r.activo ORDER BY r.nombre, i.id")
+        filas_rec = cur.fetchall()
+        cur.execute("SELECT id, " + ", ".join(NUTRI_COLS) + " FROM productos")
+        nutri = {f[0]: [float(v or 0) for v in f[1:]] for f in cur.fetchall()}
+    return productos, tamanos, empaques, filas_rec, nutri
 
 # ================= Vista del cliente =================
 def confirmacion(u):
@@ -291,17 +332,9 @@ def confirmacion(u):
 
 def vista_cliente():
     if st.session_state.get("ultimo"):
-        return confirmacion(st.session_state.ultimo)
+        return  confirmacion(st.session_state.ultimo)   
     try:
-        productos = consultar("SELECT id, emoji, nombre, precio_kg, stock_g FROM productos "
-                            "WHERE activo AND stock_g > 0 ORDER BY nombre")
-        tamanos = [r[0] for r in consultar("SELECT gramos FROM presentaciones WHERE activo ORDER BY gramos")]
-        empaques = {(t, g): float(p) for t, g, p in consultar(
-            "SELECT tipo, gramos, precio FROM empaques WHERE activo AND stock > 0")}
-        filas_rec = consultar(
-            "SELECT r.id, r.emoji, r.nombre, r.descripcion, i.producto_id, i.gramos "
-            "FROM recetas r JOIN receta_items i ON i.receta_id = r.id "
-            "WHERE r.activo ORDER BY r.nombre, i.id")
+        productos, tamanos, empaques, filas_rec, nutri = catalogo()
     except Exception as e:
         mostrar_error(e)
         st.error("Estamos teniendo un problema técnico. Intenta de nuevo en unos minutos.")
@@ -373,7 +406,7 @@ def vista_cliente():
     st.write(f"Mix: {MONEDA}{subtotal_mix:.2f} · Empaque {tipo}: {MONEDA}{precio_empaque:.2f}")
     st.subheader(f"Total: {MONEDA}{total:.2f}")
     if usado > 0:
-        tabla_nutricional(st.session_state.mix, usado)
+        tabla_nutricional(st.session_state.mix, usado, nutri)
 
     if usado > 0:
         with st.form("pedido"):
@@ -510,7 +543,7 @@ def tab_inventario():
                                  "Conteo: sumar": ("ajuste", 1), "Conteo: restar": ("ajuste", -1)}[modo]
                 c = D(str(costo)) / (1000 if es_prod else 1) if costo is not None else None
                 try:
-                    with transaccion() as cur:
+                    with transaccion(escribe=True) as cur:
                         mover(cur, tipo, iid, signo * q, motivo, costo=c, nota=nota or None, nombre=etq)
                     st.toast("Movimiento registrado ✅")
                     st.rerun()
@@ -620,7 +653,7 @@ def tab_nutricion():
 
 
 def guardar_receta(nombre, emoji, desc, items):
-    with transaccion() as cur:
+    with transaccion(escribe=True) as cur:
         cur.execute(
             "INSERT INTO recetas (nombre, emoji, descripcion) VALUES (%s,%s,%s) "
             "ON CONFLICT (nombre) DO UPDATE SET emoji=EXCLUDED.emoji, "
