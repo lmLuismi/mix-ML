@@ -319,7 +319,7 @@ def catalogo():
 
 # ================= Vista del cliente =================
 def confirmacion(u):
-    st.title("¡Pedido recibido! 🎉")
+    st.title("¡Pedido recibido! Gracias por tu compra! 🎉")
     st.success(f"{u['gramos']} g · Total {MONEDA}{u['total']:.2f}")
     for nom, g, sub in u["lineas"]:
         st.write(f"**{nom}** — {g} g · {MONEDA}{sub:.2f}")
