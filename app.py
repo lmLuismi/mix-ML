@@ -359,14 +359,14 @@ def catalogo():
 
 # ================= Vista del cliente =================
 def confirmacion(u):
-    st.title("¡Pedido recibido! 🎉")
-    st.success(f"Pedido #{u['id']} · {u['gramos']} g · Total {MONEDA}{u['total']:.2f}")
+    st.title("¡Pedido recibido!, gracias por su compra 🎉")
+    st.success(f"{u['gramos']} g · Total {MONEDA}{u['total']:.2f}")
     for nom, g, sub in u["lineas"]:
         st.write(f"**{nom}** — {g} g · {MONEDA}{sub:.2f}")
     st.write(f"Empaque {u['empaque']} — {MONEDA}{u['precio_emp']:.2f}")
     if WHATSAPP:
         detalle = "\n".join(f"- {n}: {g} g" for n, g, _ in u["lineas"])
-        msg = (f"Hola, soy {u['nombre']}. Pedido #{u['id']} (mix de {u['gramos']} g, "
+        msg = (f"Hola, soy {u['nombre']} (mix de {u['gramos']} g, "
                f"empaque {u['empaque']}):\n{detalle}\nTotal: {MONEDA}{u['total']:.2f}")
         st.link_button("Enviar por WhatsApp", f"https://wa.me/{WHATSAPP}?text={urllib.parse.quote(msg)}",
                        use_container_width=True, type="primary")
@@ -393,8 +393,13 @@ def armador(productos, tope, tipo, precio_empaque, nutri):
         c1.markdown(f"{emoji} **{nombre}**  \n{MONEDA}{float(precio_kg):.2f} /kg")
         c2.button("−", key=f"m{pid}", on_click=restar, args=(pid,), disabled=gramos == 0,
                   use_container_width=True)
-        c3.number_input(f"Gramos de {nombre}", min_value=0, step=PASO, format="%d", key=f"g{pid}",
-                        label_visibility="collapsed", on_change=escribir, args=(pid, stock))
+        c3_input, c3_texto = c3.columns([1.6, 1.4])
+        
+        c3_input.number_input(f"Gramos de {nombre}", min_value=0, step=PASO, format="%d", key=f"g{pid}",
+                                label_visibility="collapsed", on_change=escribir, args=(pid, stock),)
+        
+        c3_texto.markdown("<div style='padding-top: 8px; font-size: 14px;'>gramos</div>", unsafe_allow_html=True)
+                        
         c4.button("+", key=f"p{pid}", on_click=sumar, args=(pid, stock),
                   disabled=libre == 0 or gramos + min(PASO, libre) < MIN_G,
                   use_container_width=True)
@@ -449,7 +454,7 @@ def vista_cliente():
     recetas = {}
     for rid, emo, nom, desc, pid, g in filas_rec:
         r = recetas.setdefault(rid, {"emoji": emo, "nombre": nom, "desc": desc, "items": []})
-        r["items"].append((pid, g))
+        r["items"].append((pid , g))
     # solo se muestran los mixes cuyos productos están todos disponibles
     recetas = {k: r for k, r in recetas.items() if all(p in nombre_de for p, _ in r["items"])}
 
