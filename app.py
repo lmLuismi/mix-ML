@@ -9,7 +9,7 @@ import streamlit as st
 import os
 from zoneinfo import ZoneInfo
 import hmac
-
+import time
 from psycopg2 import pool as pg_pool
 
 def secreto(nombre, defecto=""):
@@ -296,21 +296,26 @@ def tabla_nutricional(mix, usado, datos):
 
 @st.cache_data(ttl=300, show_spinner="Cargando tu mix…")
 def catalogo():
+    cols = ", ".join(NUTRI_COLS)
     with transaccion() as cur:
-        cur.execute("SELECT id, emoji, nombre, precio_kg, stock_g FROM productos "
-                    "WHERE activo AND stock_g > 0 ORDER BY nombre")
-        productos = cur.fetchall()
-        cur.execute("SELECT gramos FROM presentaciones WHERE activo ORDER BY gramos")
-        tamanos = [r[0] for r in cur.fetchall()]
-        cur.execute("SELECT tipo, gramos, precio FROM empaques WHERE activo AND stock > 0")
-        empaques = {(t, g): float(p) for t, g, p in cur.fetchall()}
-        cur.execute("SELECT r.id, r.emoji, r.nombre, r.descripcion, i.producto_id, i.gramos "
-                    "FROM recetas r JOIN receta_items i ON i.receta_id = r.id "
-                    "WHERE r.activo ORDER BY r.nombre, i.id")
-        filas_rec = cur.fetchall()
-        cur.execute("SELECT id, " + ", ".join(NUTRI_COLS) + " FROM productos")
-        nutri = {f[0]: [float(v or 0) for v in f[1:]] for f in cur.fetchall()}
-    return productos, tamanos, empaques, filas_rec, nutri
+        cur.execute(f"""
+            SELECT json_build_object(
+              'productos', (SELECT COALESCE(json_agg(json_build_array(id, emoji, nombre, precio_kg, stock_g)
+                              ORDER BY nombre), '[]'::json) FROM productos WHERE activo AND stock_g > 0),
+              'tamanos',   (SELECT COALESCE(json_agg(gramos ORDER BY gramos), '[]'::json)
+                              FROM presentaciones WHERE activo),
+              'empaques',  (SELECT COALESCE(json_agg(json_build_array(tipo, gramos, precio)), '[]'::json)
+                              FROM empaques WHERE activo AND stock > 0),
+              'recetas',   (SELECT COALESCE(json_agg(json_build_array(r.id, r.emoji, r.nombre, r.descripcion,
+                              i.producto_id, i.gramos) ORDER BY r.nombre, i.id), '[]'::json)
+                              FROM recetas r JOIN receta_items i ON i.receta_id = r.id WHERE r.activo),
+              'nutri',     (SELECT COALESCE(json_agg(json_build_array(id, {cols})), '[]'::json) FROM productos)
+            )""")
+        d = cur.fetchone()[0]
+    productos = [tuple(f) for f in d["productos"]]
+    empaques = {(t, g): float(p) for t, g, p in d["empaques"]}
+    nutri = {f[0]: [float(v or 0) for v in f[1:]] for f in d["nutri"]}
+    return productos, d["tamanos"], empaques, [tuple(f) for f in d["recetas"]], nutri
 
 # ================= Vista del cliente =================
 def confirmacion(u):
@@ -366,8 +371,16 @@ def vista_cliente():
     if st.session_state.get("ultimo"):
         return  confirmacion(st.session_state.ultimo)   
     try:
+        t0 = time.perf_counter()
         productos, tamanos, empaques, filas_rec, nutri = catalogo()
+        t_cat = time.perf_counter() - t0
     except Exception as e:
+        if secreto("DEBUG", "false").lower() == "true":
+            t = time.perf_counter()
+        with transaccion() as cur:
+            cur.execute("SELECT 1")
+        st.caption(f"⏱ Ida y vuelta a la base: {(time.perf_counter() - t) * 1000:.0f} ms · "
+                   f"Catálogo: {t_cat:.2f} s")
         mostrar_error(e)
         st.error("Estamos teniendo un problema técnico. Intenta de nuevo en unos minutos.")
         return
