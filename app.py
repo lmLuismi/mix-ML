@@ -46,7 +46,7 @@ st.markdown("""
 div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; align-items: center; }
 div[data-testid="stColumn"], div[data-testid="column"] { min-width: 0 !important; }
 .stButton > button { min-height: 46px; font-size: 1.2rem; }
-div[data-testid="stNumberInput"] input { text-align: center; font-weight: 700; font-size: 1.2rem; min-height: 46px; }
+div[data-testid="stNumberInput"] input { text-align: center; font-weight: 700; font-size: 1.2rem; min-height: 46px; padding-left: 4px; padding-right: 4px; min-width: 0; }
 [data-testid="stNumberInputStepUp"], [data-testid="stNumberInputStepDown"], div[data-testid="stNumberInput"] button { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
@@ -389,20 +389,20 @@ def armador(productos, tope, tipo, precio_empaque, nutri):
         gramos = st.session_state.mix.get(pid, 0)
         st.session_state[f"g{pid}"] = gramos          # el cuadro siempre refleja el mix real
         libre = margen(pid, stock)
-        c1, c2, c3, c4 = st.columns([3.2, 1.2, 2.2, 1.2])
-        c1.markdown(f"{emoji} **{nombre}**  \n{MONEDA}{float(precio_kg):.2f} /kg")
-        c2.button("−", key=f"m{pid}", on_click=restar, args=(pid,), disabled=gramos == 0,
-                  use_container_width=True)
-        c3_input, c3_texto = c3.columns([1.6, 1.4])
-        
-        c3_input.number_input(f"Gramos de {nombre}", min_value=0, step=PASO, format="%d", key=f"g{pid}",
-                                label_visibility="collapsed", on_change=escribir, args=(pid, stock),)
-        
-        c3_texto.markdown("<div style='padding-top: 8px; font-size: 14px;'>gramos</div>", unsafe_allow_html=True)
-                        
-        c4.button("+", key=f"p{pid}", on_click=sumar, args=(pid, stock),
-                  disabled=libre == 0 or gramos + min(PASO, libre) < MIN_G,
-                  use_container_width=True)
+        with st.container(border=True):
+            n1, n2 = st.columns([3, 2])
+            n1.markdown(f"{emoji} **{nombre}**")
+            n2.markdown(f"<div style='text-align:right;color:#6b7466'>{MONEDA}{float(precio_kg):.2f}/kg</div>",
+                        unsafe_allow_html=True)
+            b1, b2, b3, b4 = st.columns([1.1, 2.2, 0.7, 1.1])
+            b1.button("−", key=f"m{pid}", on_click=restar, args=(pid,), disabled=gramos == 0,
+                      use_container_width=True)
+            b2.number_input(f"Gramos de {nombre}", min_value=0, step=PASO, format="%d", key=f"g{pid}",
+                            label_visibility="collapsed", on_change=escribir, args=(pid, stock))
+            b3.markdown("<div style='padding-top:10px;font-weight:600'>g</div>", unsafe_allow_html=True)
+            b4.button("+", key=f"p{pid}", on_click=sumar, args=(pid, stock),
+                      disabled=libre == 0 or gramos + min(PASO, libre) < MIN_G,
+                      use_container_width=True)
 
     usado = total_usado()
     precios = {pid: float(pk) for pid, _, _, pk, _ in productos}
