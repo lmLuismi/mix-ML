@@ -47,19 +47,18 @@ st.markdown("""
 div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; align-items: center; }
 div[data-testid="stColumn"], div[data-testid="column"] { min-width: 0 !important; }
 .stButton > button { min-height: 46px; font-size: 1.2rem; }
-div[data-testid="stNumberInput"] input { text-align: center; font-weight: 700; font-size: 1.15rem; min-height: 46px; min-width: 0; }
-[class*="st-key-card_"] div[data-testid="stNumberInput"] input, [class*="st-key-sel_"] div[data-testid="stNumberInput"] input { padding-left: 2px; padding-right: 16px; }
-[class*="st-key-card_"] [data-testid="stNumberInputStepUp"], [class*="st-key-card_"] [data-testid="stNumberInputStepDown"],
-[class*="st-key-sel_"] [data-testid="stNumberInputStepUp"], [class*="st-key-sel_"] [data-testid="stNumberInputStepDown"] { display: none !important; }
-[class*="st-key-card_"] div[data-testid="stNumberInputContainer"], [class*="st-key-sel_"] div[data-testid="stNumberInputContainer"] { position: relative; }
-[class*="st-key-card_"] div[data-testid="stNumberInputContainer"]::after, [class*="st-key-sel_"] div[data-testid="stNumberInputContainer"]::after { content: "g"; position: absolute; right: 8px; top: 50%; transform: translateY(-50%); font-weight: 600; color: #6b7466; pointer-events: none; }
+div[data-testid="stNumberInput"] input { text-align: center; font-weight: 700; font-size: 1.2rem; min-height: 46px; padding-left: 4px; padding-right: 4px; min-width: 0; }
+div[data-testid="stNumberInput"] input { text-align: center; font-weight: 700; font-size: 1.15rem; min-height: 46px; padding-left: 2px; padding-right: 16px; min-width: 0; }
+div[data-testid="stNumberInputContainer"] { position: relative; }
+div[data-testid="stNumberInputContainer"]::after { content: "g"; position: absolute; right: 8px; top: 50%; transform: translateY(-50%); font-weight: 600; color: #6b7466; pointer-events: none; }
 .pn { font-weight: 700; font-size: 1rem; line-height: 1.2; }
-.pp { color: #6b7466; font-size: .8rem; line-height: 1.3; }
+.pp { color: #b8b8b8; font-size: .8rem; line-height: 1.3; }
 .pp b { color: #7B4A2B; }
-[class*="st-key-sel_"] { background: #F7EFE3; border-radius: 14px; }
+[class*="st-key-sel_"] { background: #858d5e; border-radius: 14px; }
 [class*="st-key-sel_"] > div, [class*="st-key-card_"] > div { padding: 0; }
 .nutri th { white-space: nowrap; }
 .nutri td:not(:first-child), .nutri th:not(:first-child) { padding-left: .6rem; }
+[data-testid="stNumberInputStepUp"], [data-testid="stNumberInputStepDown"], div[data-testid="stNumberInput"] button { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
 
